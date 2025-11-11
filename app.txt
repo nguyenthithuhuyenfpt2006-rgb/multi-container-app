@@ -1,0 +1,186 @@
+name: Generate Pull Request Description
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    # giảm gọi API khi sửa file không liên quan
+    paths:
+      - "**/*.py"
+      - "**/*.php"
+      - "**/*.js"
+      - "**/*.ts"
+      - "detection/**"
+      - "result_anomaly/**"
+      - "!**/*.md"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-desc-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  generate_description:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install packaging google-generativeai==0.8.3
+
+      - name: Get PR info
+        id: pr
+        run: |
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          echo "BASE_SHA=${{ github.event.pull_request.base.sha }}" >> $GITHUB_OUTPUT
+          echo "HEAD_SHA=${{ github.event.pull_request.head.sha }}" >> $GITHUB_OUTPUT
+          echo "BASE_REF=${{ github.event.pull_request.base.ref }}" >> $GITHUB_OUTPUT
+          echo "HEAD_REF=${{ github.event.pull_request.head.ref }}" >> $GITHUB_OUTPUT
+
+      - name: Prepare git range & collect changes
+        id: diff
+        run: |
+          git fetch --no-tags --prune origin
+          echo "Range: ${{ steps.pr.outputs.BASE_SHA }}..${{ steps.pr.outputs.HEAD_SHA }}"
+
+          # commit messages (mới -> cũ), giới hạn 50 dòng cho gọn
+          COMMITS=$(git log --pretty=format:"%s" "${{ steps.pr.outputs.BASE_SHA }}..${{ steps.pr.outputs.HEAD_SHA }}" | head -n 50)
+          {
+            echo "COMMIT_MESSAGES<<EOF"
+            echo "$COMMITS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # file list thay đổi
+          git diff --name-status "${{ steps.pr.outputs.BASE_SHA }}..${{ steps.pr.outputs.HEAD_SHA }}" > file_list.txt
+
+          # diff rút gọn: bỏ context để giảm token, giới hạn 200kB
+          git diff --unified=0 "${{ steps.pr.outputs.BASE_SHA }}..${{ steps.pr.outputs.HEAD_SHA }}" > full_diff.txt || true
+          head -c 200000 full_diff.txt > full_diff_trimmed.txt
+
+      - name: Create generator script
+        run: |
+          cat > generate_description.py << 'EOPY'
+          import os, sys, re, time
+          import google.generativeai as genai
+
+          API_KEY = os.environ.get("GEMINI_API_KEY")
+          if not API_KEY:
+              print("missing GEMINI_API_KEY", file=sys.stderr); sys.exit(1)
+          genai.configure(api_key=API_KEY)
+
+          MODEL_CANDIDATES = ["gemini-1.5-flash-8b", "gemini-1.5-flash", "gemini-2.0-flash"]
+
+          def read(path, default=""):
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      return f.read()
+              except Exception as e:
+                  print(f"[warn] cannot read {path}: {e}", file=sys.stderr)
+                  return default
+
+          commits = os.environ.get("COMMIT_MESSAGES","")
+          files = read("file_list.txt")
+          diff = read("full_diff_trimmed.txt")
+
+          # prompt ngắn gọn để giảm token
+          prompt = f"""
+          Viết phần mô tả Pull Request NGẮN GỌN, chuyên nghiệp, bằng tiếng Việt (có dấu).
+          Cấu trúc:
+          - Tiêu đề (1 dòng)
+          - Tóm tắt ngắn (2-4 câu)
+          - Thay đổi chính (bullet)
+          - Ảnh hưởng/kiểm thử (bullet)
+          - Việc cần review (bullet nếu có)
+
+          Chỉ dựa trên nội dung dưới đây, không bịa thêm:
+
+          [Commit messages (mới→cũ)]
+          {commits}
+
+          [Danh sách file thay đổi (git diff --name-status)]
+          {files}
+
+          [Diff rút gọn (u=0)]
+          {diff}
+          """
+
+          def parse_retry_seconds(msg, default=60):
+              m = re.search(r"retry_delay\\s*{\\s*seconds\\s*:\\s*(\\d+)", str(msg), re.I)
+              if m: return max(int(m.group(1)), 5)
+              m = re.search(r"Retry-After:\\s*(\\d+)", str(msg), re.I)
+              return max(int(m.group(1)), 5) if m else default
+
+          def call_with_retry(prompt, max_retries=3):
+              last = None
+              for attempt in range(max_retries+1):
+                  for model_name in MODEL_CANDIDATES:
+                      try:
+                          model = genai.GenerativeModel(model_name)
+                          resp = model.generate_content(
+                              prompt,
+                              generation_config={"temperature":0.2, "max_output_tokens": 768}
+                          )
+                          return resp.text or ""
+                      except Exception as e:
+                          msg = str(e)
+                          last = e
+                          if "429" in msg or "quota" in msg.lower():
+                              wait = parse_retry_seconds(msg, default=60 + 30*attempt)
+                              print(f"[retry] {model_name} 429, sleep {wait}s", file=sys.stderr)
+                              time.sleep(wait)
+                              continue
+                          else:
+                              print(f"[warn] {model_name} failed: {msg[:200]}", file=sys.stderr)
+                              continue
+                  time.sleep(3)
+              raise last
+
+          try:
+              body = call_with_retry(prompt).strip()
+              # gỡ code fence nếu có
+              body = re.sub(r'^```[\\w-]*\\n', '', body)
+              body = re.sub(r'\\n```\\s*$', '', body)
+              if not body:
+                  body = "Cập nhật mô tả sẽ được bổ sung sau (tạm thời thiếu nội dung)."
+              with open("pr_description.txt","w",encoding="utf-8") as f:
+                  f.write(body)
+              print("OK: pr_description.txt")
+          except Exception as e:
+              print(f"Error generating description: {e}", file=sys.stderr)
+              sys.exit(1)
+          EOPY
+
+      - name: Generate Description (with retry wrapper)
+        uses: nick-fields/retry@v3
+        with:
+          max_attempts: 2
+          retry_on: error
+          timeout_minutes: 6
+          command: python generate_description.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          COMMIT_MESSAGES: ${{ steps.diff.outputs.COMMIT_MESSAGES }}
+
+      - name: Update Pull Request body (gh api)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            --method PATCH \
+            repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.PR_NUMBER }} \
+            -F body=@pr_description.txt
